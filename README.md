@@ -17,6 +17,12 @@ Built against upstream commit **`01478e1`** ("Move Build log under Improved head
 | `quickadb-updates.zip` | The changed files, ready to copy over a QuickADB folder. Also includes the patch and `HOW-TO-UPDATE.txt`. |
 | `quickadb-updates.patch` | The same changes as a git patch, for a fresh clone. |
 
+## Download
+
+**[Download v5.3.6-mod.1](https://github.com/honeybugserial/QuickADB-Addons/releases/tag/v5.3.6-mod.1)**
+
+The release page has the compiled Windows exe. To run from source instead, use the zip or patch below.
+
 ## Installing
 
 Use **one** of these methods, not both.
