@@ -1,0 +1,1517 @@
+diff --git a/QuickADB.spec b/QuickADB.spec
+index 6bcdb0c..c91df44 100644
+--- a/QuickADB.spec
++++ b/QuickADB.spec
+@@ -16,7 +16,8 @@ hiddenimports = (
+ )
+ 
+ datas = [
+-    ('platform-tools/*', 'platform-tools'),
++    # platform-tools is NOT bundled: adb started from the one-file temp folder keeps it
++    # locked after exit. QuickADB finds adb on PATH / next to the exe, or downloads it.
+     ('res/*', 'res'),
+     ('themes/*', 'themes'),
+     ('util/*', 'util'),
+diff --git a/build.py b/build.py
+index f115ba5..5c206d4 100644
+--- a/build.py
++++ b/build.py
+@@ -236,7 +236,7 @@ def main():
+ 
+     # Clean old build/dist and dependencies
+     print("Cleaning environment...")
+-    dirs_to_clean = ["build", "dist", "QuickADB.AppDir", "platform-tools", "temp_pd"]
++    dirs_to_clean = ["build", "dist", "QuickADB.AppDir", "temp_pd"]  # keep platform-tools: source runs use it
+     for d in dirs_to_clean:
+         full_d = os.path.join(ROOT_DIR, d)
+         if os.path.exists(full_d):
+@@ -272,11 +272,8 @@ def main():
+         except Exception as e:
+             print(f"Warning: Could not remove appimagetool: {e}")
+ 
+-    # 1. Download and Extract Platform Tools
+-    pt_zip = os.path.join(ROOT_DIR, "platform-tools.zip")
+-    download_file(PLATFORM_TOOLS_URLS[os_name], pt_zip)
+-    extract_zip(pt_zip, ROOT_DIR)
+-    os.remove(pt_zip)
++    # 1. platform-tools is no longer bundled into the executable. At runtime QuickADB uses
++    #    adb from the system PATH or from its own folder, and offers to download it if missing.
+ 
+     # 2. Download and Extract Payload Dumper Go (skipped on Windows ARM64 as upstream binaries are unavailable)
+     if os_name == "Windows" and arch == "arm64":
+@@ -325,14 +322,6 @@ def main():
+         print("Error: Could not download unsuper.py")
+         sys.exit(1)
+ 
+-    # 4. Handle platform-tools permissions
+-    pt_dir = os.path.join(ROOT_DIR, "platform-tools")
+-    if os_name != "Windows" and os.path.exists(pt_dir):
+-        for f in ["adb", "fastboot", "mke2fs"]:
+-            fpath = os.path.join(pt_dir, f)
+-            if os.path.exists(fpath):
+-                os.chmod(fpath, 0o755)
+-
+     # 5. Run PyInstaller
+     print("Starting PyInstaller build...")
+     spec_path = os.path.join(ROOT_DIR, "QuickADB.spec")
+diff --git a/main/quickadb.py b/main/quickadb.py
+index 8e52089..0dd4783 100644
+--- a/main/quickadb.py
++++ b/main/quickadb.py
+@@ -27,6 +27,7 @@ from modules.payloaddumper import show_payload_dumper_window
+ from modules.fossmarket import run_foss_market
+ from modules.gsiflasher import GSIFlasherUI
+ from modules.logcat import run_logcat_window
++from modules.scrcpy import run_scrcpy_window
+ from modules.magiskmanager import run_root_manager
+ from modules.superdumper import show_super_img_dumper
+ from modules.fileexplorer import ADBFileExplorer
+@@ -35,15 +36,16 @@ from modules.partitionmanager import PartitionManager
+ from util.thememanager import ThemeManager
+ from util.updater import UpdateManager
+ import main.adbfunc as adbfunc
++from util.platformtools import prompt_adb_missing, start_download
+ import modules.bootanimcreator as bootanimcreator
+ 
+ from PyQt6.QtWidgets import (
+     QApplication, QMainWindow, QWidget, QPushButton, QLabel, QFrame,
+     QGridLayout, QVBoxLayout, QHBoxLayout, QTextEdit, QMessageBox,
+-    QFileDialog, QScrollArea, QDialog, QTextBrowser, QComboBox, QSizePolicy
++    QFileDialog, QScrollArea, QDialog, QTextBrowser, QComboBox, QSizePolicy, QButtonGroup
+ )
+ from PyQt6.QtGui import QTextCursor, QColor
+-from PyQt6.QtCore import Qt, QThread, pyqtSignal
++from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+ 
+ try:
+     from PyQt6.QtSvgWidgets import QSvgWidget
+@@ -103,6 +105,7 @@ class QuickADBApp(QMainWindow):
+         self.foss_market_window = None
+         self.logcat_window = None
+         self.root_manager_window = None
++        self.scrcpy_window = None
+ 
+         # Init
+         self.init_ui()
+@@ -112,12 +115,17 @@ class QuickADBApp(QMainWindow):
+         self._init_updater()
+         adbfunc.add_methods_to_class(self)
+         self.check_for_update()
++        # Open on the first tab instead of an empty panel
++        self.tab_buttons["ADB Operations"].setChecked(True)
++        self.show_adb_commands()
++        # After the window is shown: report which adb is used, or offer to download it
++        QTimer.singleShot(0, self._check_adb_on_startup)
+ 
+     # UI Setup
+ 
+     def init_ui(self):
+         self.setWindowTitle("QuickADB")
+-        self.setMinimumSize(1050, 620)
++        self.setMinimumSize(1240, 620)  # room for 5 tabs + the 2 action buttons on the right
+ 
+         central_widget = QWidget()
+         self.setCentralWidget(central_widget)
+@@ -172,13 +180,37 @@ class QuickADBApp(QMainWindow):
+ 
+         menu_buttons = {
+             "ADB Operations": self.show_adb_commands, "Fastboot Operations": self.show_fastboot_commands,
+-            "Flashing Operations": self.show_flashing_commands, "Open Terminal": self.open_terminal,
++            "Flashing Operations": self.show_flashing_commands,
+             "Advanced": self.show_advanced, "Miscellaneous": self.show_misc
+         }
++        # Tabs: checkable and mutually exclusive, so the open tab stays highlighted
++        self.tab_group = QButtonGroup(self)
++        self.tab_group.setExclusive(True)
++        self.tab_buttons = {}
+         for text, callback in menu_buttons.items():
+-            menu_layout.addWidget(self.create_menu_button(text, callback))
++            button = self.create_menu_button(text, callback)
++            button.setCheckable(True)
++            button.setObjectName("tabButton")
++            # Only the checked state is styled here; unselected tabs keep the theme's look
++            button.setStyleSheet(
++                "QPushButton#tabButton:checked {"
++                " background: rgba(46, 223, 133, 0.16);"
++                " border: 1px solid #2edf85; border-bottom: 3px solid #2edf85;"
++                " border-radius: 6px; font-weight: bold; }"
++            )
++            self.tab_group.addButton(button)
++            self.tab_buttons[text] = button
++            menu_layout.addWidget(button)
+         menu_layout.addStretch()
+ 
++        # Actions (they open a window) rather than tabs: kept apart at the right, outlined
++        self.scrcpy_button = self._make_action_button(
++            "\u25A3  Screen Mirror", self.launch_scrcpy, "Mirror and control the device with scrcpy")
++        self.terminal_button = self._make_action_button(
++            ">_  Open Terminal", self.open_terminal, "Open the QuickADB terminal in a new window")
++        menu_layout.addWidget(self.scrcpy_button)
++        menu_layout.addWidget(self.terminal_button)
++
+         # Main content area
+         content_layout = QHBoxLayout()
+         main_layout.addLayout(content_layout, 1)
+@@ -249,6 +281,19 @@ class QuickADBApp(QMainWindow):
+         button.clicked.connect(callback)
+         return button
+ 
++    def _make_action_button(self, text: str, callback: Callable, tooltip: str) -> QPushButton:
++        """Outlined button for actions that open a window, as opposed to the tab buttons.
++        Only border/background are set, so each theme keeps its own text, font and hover styling."""
++        button = self._make_button(text, callback)
++        button.setObjectName("actionButton")
++        button.setToolTip(tooltip)
++        button.setCursor(Qt.CursorShape.PointingHandCursor)
++        button.setStyleSheet(
++            "QPushButton#actionButton { background: transparent; border: 1px solid #2edf85; border-radius: 6px; }"
++            "QPushButton#actionButton:pressed { border-width: 2px; }"
++        )
++        return button
++
+     def create_menu_button(self, text: str, callback: Callable) -> QPushButton:
+         """Creates a standard menu button."""
+         return self._make_button(text, callback)
+@@ -256,6 +301,8 @@ class QuickADBApp(QMainWindow):
+     def create_command_button(self, text: str, callback: Callable, row: int, column: int) -> QPushButton:
+         """Creates a command button and adds it to the grid layout."""
+         button = self._make_button(text, callback)
++        if text == "Get platform-tools":
++            button.setToolTip("Download Google's platform-tools (adb + fastboot) into the QuickADB folder")
+         if text == "Dump payload.bin" and sys.platform == "win32" and platform.machine().lower() in ("arm64", "aarch64"):
+             button.setEnabled(False)
+             button.setToolTip("Payload Dumper is unavailable on Windows ARM64")
+@@ -274,11 +321,49 @@ class QuickADBApp(QMainWindow):
+     def _get_executable_path(self, name: str) -> Optional[str]:
+         """Returns the full path for an executable via the centralized ToolPaths."""
+         tp = ToolPaths.instance()
+-        if not os.path.isdir(tp.platform_tools_dir):
+-            QMessageBox.critical(self, "Error", f"platform-tools folder not found at: {tp.platform_tools_dir}")
++        if not tp.found:
++            prompt_adb_missing(self, self._after_platform_tools_install)
+             return None
+         return getattr(tp, name, None) or tp.adb  # fallback
+ 
++    # --- adb detection ---
++
++    def _log_adb_source(self):
++        tp = ToolPaths.instance()
++        if tp.found:
++            self.log_action(f"Using adb: {tp.adb}  ({tp.source})", "#77DD77")
++            if not tp.fastboot_found:
++                self.log_action("fastboot not found; fastboot features won't work.", "#FDFD96")
++        else:
++            self.log_action("adb not found on the system PATH or in the QuickADB folder. "
++                            "Use Misc > Get platform-tools.", "#ff6666")
++
++    def _check_adb_on_startup(self):
++        self._log_adb_source()
++        if not ToolPaths.instance().found:
++            prompt_adb_missing(self, self._after_platform_tools_install)
++
++    def download_platform_tools(self):
++        """Misc > Download platform-tools: (re)install Google's platform-tools next to QuickADB."""
++        tp = ToolPaths.instance()
++        if tp.found and tp.source == "system PATH":
++            resp = QMessageBox.question(
++                self, "platform-tools",
++                f"adb is already on your system PATH:\n{tp.adb}\n\n"
++                "QuickADB uses the PATH copy first, so a downloaded copy would be ignored "
++                "while that one is there. Download anyway?")
++            if resp != QMessageBox.StandardButton.Yes:
++                return
++        start_download(self, self._after_platform_tools_install)
++
++    def _after_platform_tools_install(self, ok: bool):
++        if not ok:
++            return
++        self.platform_tools_path = ToolPaths.instance().platform_tools_dir
++        self._log_adb_source()
++        self.fetch_versions()
++        self.check_devices()
++
+     def run_command_async(self, command: Union[str, List[str]], description: str = "", command_type: str = ""):
+         """Executes a command asynchronously in a separate thread."""
+         current_time = time.strftime("%H:%M:%S")
+@@ -428,7 +513,8 @@ class QuickADBApp(QMainWindow):
+         """Populates the grid with miscellaneous command buttons."""
+         commands = [("Device Specifications", self.show_device_info),
+                     ("Boot Animation Creator", self.launch_bootanim_creator),
+-                    ("App Market", self.launch_foss_market)]
++                    ("App Market", self.launch_foss_market),
++                    ("Get platform-tools", self.download_platform_tools)]
+         self._populate_commands_grid(commands)
+ 
+     # --- Feature Implementations & Launchers ---
+@@ -499,6 +585,12 @@ class QuickADBApp(QMainWindow):
+             lambda: run_logcat_window()
+         )
+ 
++    def launch_scrcpy(self):
++        self._focus_or_launch(
++            'scrcpy_window',
++            lambda: run_scrcpy_window()
++        )
++
+     def _focus_or_launch(self, attr: str, factory: Callable):
+         """Raise the existing window if visible, otherwise create it via factory."""
+         try:
+diff --git a/modules/appmanager.py b/modules/appmanager.py
+index 595dc52..6a42a08 100644
+--- a/modules/appmanager.py
++++ b/modules/appmanager.py
+@@ -1150,4 +1150,4 @@ def run_app_manager(custom_platform_tools_path=None):
+     return window
+ 
+ if __name__ == "__main__":
+-    sys.exit(run_app_manager(custom_platform_tools_path=resource_path('platform-tools')))
++    sys.exit(run_app_manager())
+diff --git a/modules/bootanimcreator.py b/modules/bootanimcreator.py
+index 640a034..c0c1f60 100644
+--- a/modules/bootanimcreator.py
++++ b/modules/bootanimcreator.py
+@@ -582,7 +582,7 @@ class BootAnimWidget(QWidget):
+ 
+         # create temp work dirs
+         ensure_work_dirs()
+-        self.adb_cmd = ADB_CMD
++        self.adb_cmd = ToolPaths.instance().adb  # looked up now, not at import, so a fresh download is used
+ 
+         self.remote_path: Optional[str] = None
+         self.current_info: Optional[Dict] = None
+@@ -1249,7 +1249,7 @@ class BootAnimWidget(QWidget):
+         if proc.stderr:
+             logs.append(f"[PUSH] {label} stderr: {proc.stderr.strip()}")
+ 
+-    def _push_zip_verbose_sync(self, local_zip: str, remote_path: Optional[str], adb_cmd: str = ADB_CMD) -> str:
++    def _push_zip_verbose_sync(self, local_zip: str, remote_path: Optional[str], adb_cmd: Optional[str] = None) -> str:
+         """
+         Push the given local_zip to the device. Produce a verbose log describing each step.
+         Returns a string (log).
+diff --git a/modules/gsiflasher.py b/modules/gsiflasher.py
+index b098906..a8b0e69 100644
+--- a/modules/gsiflasher.py
++++ b/modules/gsiflasher.py
+@@ -98,7 +98,7 @@ class GSIFlasherUI(QMainWindow):
+     def __init__(self, platform_tools_path=None, parent=None):
+         super().__init__(parent)
+ 
+-        self.platform_tools_path = platform_tools_path or os.path.join(root_dir, "platform-tools")
++        self.platform_tools_path = platform_tools_path or ToolPaths.instance().platform_tools_dir
+         self.gsi_image_path = None
+         self.system_partition_available = False
+         self.fastbootd_confirmed = False
+diff --git a/modules/scrcpy.py b/modules/scrcpy.py
+new file mode 100644
+index 0000000..3294e82
+--- /dev/null
++++ b/modules/scrcpy.py
+@@ -0,0 +1,822 @@
++"""
++scrcpy.py - Screen mirroring / control launcher for QuickADB, powered by Genymobile's scrcpy.
++
++scrcpy is NOT bundled (similar to FFmpeg). It is looked up in this order:
++  1. Anywhere under <QuickADB folder>/bin, whatever the subfolders are called
++     (e.g. bin/scrcpy.exe, bin/scrcpy-win64-v3.3.4/scrcpy.exe)
++  2. A path the user picked previously with "Browse..." (remembered via QSettings)
++  3. The system PATH
++  4. Common install locations that may be missing from PATH (winget, Scoop,
++     Chocolatey, Homebrew, Snap, ~/.local/bin, ...)
++
++The "QuickADB folder" is the folder containing main.py when run from source, or the
++folder containing the QuickADB executable in a packaged build.
++
++scrcpy is launched with QuickADB's own adb (via the ADB environment variable) and the
++device selected in the main window's dropdown, so both tools share one adb server.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import platform
++import re
++import shutil
++import ssl
++import tarfile
++import urllib.request
++import zipfile
++import subprocess
++import sys
++from typing import List, Optional
++
++from util.resource import get_clean_env, get_root_dir, open_url_safe
++from util.toolpaths import ToolPaths
++from util.devicemanager import DeviceManager
++from util.thememanager import ThemeManager
++
++root_dir = get_root_dir()
++if root_dir not in sys.path:
++    sys.path.insert(0, root_dir)
++
++from PyQt6.QtCore import Qt, QThread, QSettings, QTimer, pyqtSignal
++from PyQt6.QtGui import QTextCursor
++from PyQt6.QtWidgets import (
++    QApplication,
++    QCheckBox,
++    QComboBox,
++    QFileDialog,
++    QGridLayout,
++    QGroupBox,
++    QHBoxLayout,
++    QLabel,
++    QLineEdit,
++    QMainWindow,
++    QMessageBox,
++    QPlainTextEdit,
++    QProgressDialog,
++    QPushButton,
++    QSpinBox,
++    QVBoxLayout,
++    QWidget,
++)
++
++MODULE_VERSION = 6  # bump when this file changes; shown in the window and by add_scrcpy.py
++
++SCRCPY_URL = "https://github.com/Genymobile/scrcpy#get-the-app"
++SCRCPY_RELEASES_API = "https://api.github.com/repos/Genymobile/scrcpy/releases/latest"
++MISSING_COLOR = "#ff6666"
++SETTINGS_KEY_PATH = "scrcpy/path"
++
++# Hides the console window scrcpy would otherwise open on Windows.
++_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
++
++
++def _settings() -> QSettings:
++    return QSettings("QuickADB", "QuickADB")
++
++
++def _exe_name() -> str:
++    return "scrcpy.exe" if os.name == "nt" else "scrcpy"
++
++
++def app_dir() -> str:
++    """Folder the user sees QuickADB in (not PyInstaller's temporary extraction folder)."""
++    if getattr(sys, "frozen", False):
++        exe = sys.executable
++        # Linux AppImage: the real file lives outside the mounted image
++        exe = os.environ.get("APPIMAGE", exe)
++        return os.path.dirname(os.path.abspath(exe))
++    return get_root_dir()
++
++
++BIN_SEARCH_DEPTH = 4  # how many folder levels below bin/ to look
++
++
++def _version_key(path: str) -> tuple:
++    """Extract a version like v3.3.4 from the folder names, for picking the newest copy."""
++    import re
++    m = re.findall(r"v?(\d+)\.(\d+)(?:\.(\d+))?", path.replace("\\", "/"))
++    if not m:
++        return (0, 0, 0)
++    return tuple(int(x or 0) for x in m[-1])
++
++
++def _local_bin_candidates() -> List[str]:
++    """Find every scrcpy executable anywhere under <QuickADB>/bin (up to BIN_SEARCH_DEPTH levels),
++    whatever the folders are called, e.g. bin/scrcpy.exe, bin/scrcpy/scrcpy.exe,
++    bin/scrcpy-win64-v3.3.4/scrcpy.exe, bin/tools/Scrcpy 3.3/scrcpy.exe.
++
++    Best match first: a copy with scrcpy-server next to it (a complete release folder),
++    then the shallowest, then the newest version found in the folder name."""
++    base = os.path.join(app_dir(), "bin")
++    if not os.path.isdir(base):
++        return []
++    exe = _exe_name().lower()
++    base_depth = base.rstrip(os.sep).count(os.sep)
++    found = []
++    for dirpath, dirnames, filenames in os.walk(base):
++        depth = dirpath.rstrip(os.sep).count(os.sep) - base_depth
++        if depth >= BIN_SEARCH_DEPTH:
++            dirnames[:] = []  # don't descend further
++        dirnames.sort()
++        lower = {f.lower(): f for f in filenames}
++        if exe in lower:
++            path = os.path.join(dirpath, lower[exe])
++            has_server = "scrcpy-server" in lower
++            found.append((not has_server, depth, tuple(-v for v in _version_key(os.path.relpath(path, base))), path))
++    return [path for *_, path in sorted(found)]
++
++
++def _common_install_candidates() -> List[str]:
++    """Typical install spots, for when scrcpy is installed but not on this process's PATH
++    (e.g. GUI apps on macOS don't inherit Homebrew's PATH)."""
++    home = os.path.expanduser("~")
++    exe = _exe_name()
++    if os.name == "nt":
++        local = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
++        program_data = os.environ.get("ProgramData", r"C:\ProgramData")
++        cands = [
++            os.path.join(local, "Microsoft", "WinGet", "Links", exe),
++            os.path.join(home, "scoop", "shims", exe),
++            os.path.join(program_data, "chocolatey", "bin", exe),
++        ]
++        # winget's unpacked package folder, e.g. Genymobile.scrcpy_.../scrcpy-win64-v3.x/scrcpy.exe
++        pkgs = os.path.join(local, "Microsoft", "WinGet", "Packages")
++        if os.path.isdir(pkgs):
++            for name in sorted(os.listdir(pkgs), reverse=True):
++                if name.lower().startswith("genymobile.scrcpy"):
++                    pkg = os.path.join(pkgs, name)
++                    for sub in sorted(os.listdir(pkg), reverse=True):
++                        cands.append(os.path.join(pkg, sub, exe))
++                    cands.append(os.path.join(pkg, exe))
++        return cands
++    return [
++        "/opt/homebrew/bin/scrcpy",
++        "/usr/local/bin/scrcpy",
++        "/usr/bin/scrcpy",
++        "/snap/bin/scrcpy",
++        os.path.join(home, ".local", "bin", "scrcpy"),
++        os.path.join(home, "bin", "scrcpy"),
++    ]
++
++
++def _usable(path: Optional[str]) -> bool:
++    return bool(path) and os.path.isfile(path) and (os.name == "nt" or os.access(path, os.X_OK))
++
++
++def find_scrcpy_with_source() -> tuple[Optional[str], str]:
++    """Return (path, where-it-was-found), or (None, "") if scrcpy isn't available."""
++    for cand in _local_bin_candidates():
++        if _usable(cand):
++            return cand, "QuickADB bin folder"
++
++    saved = _settings().value(SETTINGS_KEY_PATH, "", type=str)
++    if _usable(saved):
++        return saved, "chosen with Browse"
++
++    on_path = shutil.which("scrcpy")
++    if on_path:
++        return on_path, "system PATH"
++
++    for cand in _common_install_candidates():
++        if _usable(cand):
++            return cand, "system install"
++
++    return None, ""
++
++
++def find_scrcpy() -> Optional[str]:
++    """Return a usable scrcpy executable path, or None."""
++    return find_scrcpy_with_source()[0]
++
++
++def scrcpy_env() -> dict:
++    """Environment for scrcpy: clean env + QuickADB's adb, so we don't start a second adb server."""
++    env = get_clean_env()
++    adb = ToolPaths.instance().adb
++    if adb and os.path.isfile(adb):
++        env["ADB"] = adb
++        env["PATH"] = os.path.dirname(adb) + os.pathsep + env.get("PATH", "")
++    return env
++
++
++def get_scrcpy_version(exe: str) -> Optional[str]:
++    try:
++        proc = subprocess.run(
++            [exe, "--version"], capture_output=True, text=True, timeout=8,
++            env=scrcpy_env(), creationflags=_CREATE_NO_WINDOW,
++        )
++        first = (proc.stdout or proc.stderr).strip().splitlines()
++        return first[0].strip() if first else None
++    except Exception:
++        return None
++
++
++def release_asset_pattern() -> Optional[str]:
++    """Regex for this OS's scrcpy release archive, e.g. scrcpy-win64-v3.3.4.zip. None if unsupported."""
++    system, machine = platform.system(), platform.machine().lower()
++    arm = machine in ("arm64", "aarch64")
++    if system == "Windows":
++        arch = "winarm64" if arm else ("win64" if sys.maxsize > 2**32 or machine.endswith("64") else "win32")
++        return rf"^scrcpy-{arch}-v[\d.]+\.zip$"
++    if system == "Darwin":
++        return rf"^scrcpy-macos-{'aarch64' if arm else 'x86_64'}-v[\d.]+\.tar\.gz$"
++    if system == "Linux" and machine in ("x86_64", "amd64"):
++        return r"^scrcpy-linux-x86_64-v[\d.]+\.tar\.gz$"
++    return None
++
++
++def _ssl_context() -> ssl.SSLContext:
++    try:
++        import certifi
++        return ssl.create_default_context(cafile=certifi.where())
++    except Exception:
++        return ssl.create_default_context()
++
++
++def _open(url: str, timeout: float = 30):
++    req = urllib.request.Request(url, headers={"User-Agent": "QuickADB",
++                                               "Accept": "application/vnd.github+json"})
++    return urllib.request.urlopen(req, timeout=timeout, context=_ssl_context())
++
++
++def _safe_extract(archive: str, dest: str):
++    """Extract a .zip or .tar.gz into dest, refusing paths that escape it."""
++    dest_real = os.path.realpath(dest)
++
++    def check(name: str):
++        target = os.path.realpath(os.path.join(dest, name))
++        if target != dest_real and not target.startswith(dest_real + os.sep):
++            raise ValueError(f"Unsafe path in archive: {name}")
++
++    if archive.endswith(".zip"):
++        with zipfile.ZipFile(archive) as z:
++            for n in z.namelist():
++                check(n)
++            z.extractall(dest)
++    else:
++        with tarfile.open(archive, "r:gz") as t:
++            members = t.getmembers()
++            for m in members:
++                check(m.name)
++                if m.issym() or m.islnk():
++                    check(os.path.join(os.path.dirname(m.name), m.linkname))
++            t.extractall(dest, members=members)
++
++
++class ScrcpyDownloader(QThread):
++    """Downloads the latest scrcpy release for this OS into <QuickADB>/bin and unpacks it."""
++    progress = pyqtSignal(int, int)  # bytes done, total
++    status = pyqtSignal(str)
++    done = pyqtSignal(str)           # extracted folder
++    failed = pyqtSignal(str)
++
++    def __init__(self, dest: str):
++        super().__init__()
++        self.dest = dest
++        self._cancel = False
++
++    def cancel(self):
++        self._cancel = True
++
++    def run(self):
++        archive = None
++        try:
++            pattern = release_asset_pattern()
++            if not pattern:
++                raise RuntimeError(f"No prebuilt scrcpy for {platform.system()} {platform.machine()}.")
++            self.status.emit("Looking up the latest scrcpy release...")
++            with _open(SCRCPY_RELEASES_API) as resp:
++                release = json.load(resp)
++            assets = release.get("assets", [])
++            asset = next((a for a in assets if re.search(pattern, a.get("name", ""))), None)
++            if not asset:
++                raise RuntimeError(f"Release {release.get('tag_name', '?')} has no file for this system.")
++            name = asset["name"]
++
++            # Expected SHA-256: GitHub's asset digest, else the release's SHA256SUMS.txt
++            expected = None
++            digest = asset.get("digest") or ""
++            if digest.startswith("sha256:"):
++                expected = digest.split(":", 1)[1].lower()
++            else:
++                sums = next((a for a in assets if a.get("name") == "SHA256SUMS.txt"), None)
++                if sums:
++                    with _open(sums["browser_download_url"]) as resp:
++                        for line in resp.read().decode("utf-8", "replace").splitlines():
++                            parts = line.split()
++                            if len(parts) == 2 and parts[1].lstrip("*") == name:
++                                expected = parts[0].lower()
++
++            os.makedirs(self.dest, exist_ok=True)
++            archive = os.path.join(self.dest, name + ".part")
++            self.status.emit(f"Downloading {name}...")
++            h = hashlib.sha256()
++            with _open(asset["browser_download_url"], timeout=60) as resp, open(archive, "wb") as out:
++                total = int(resp.headers.get("Content-Length") or asset.get("size") or 0)
++                got = 0
++                while True:
++                    if self._cancel:
++                        raise InterruptedError("Download cancelled.")
++                    chunk = resp.read(256 * 1024)
++                    if not chunk:
++                        break
++                    out.write(chunk)
++                    h.update(chunk)
++                    got += len(chunk)
++                    self.progress.emit(got, total)
++
++            if expected and h.hexdigest() != expected:
++                raise RuntimeError("Checksum mismatch: the download is corrupt or was tampered with.")
++
++            self.status.emit("Extracting...")
++            final = archive[:-len(".part")]
++            os.replace(archive, final)
++            archive = final
++            _safe_extract(archive, self.dest)
++            folder = os.path.join(self.dest, re.sub(r"\.(zip|tar\.gz)$", "", name))
++            if os.name != "nt" and os.path.isfile(os.path.join(folder, "scrcpy")):
++                os.chmod(os.path.join(folder, "scrcpy"), 0o755)
++            self.done.emit(folder)
++        except Exception as e:
++            self.failed.emit(str(e))
++        finally:
++            if archive and os.path.exists(archive):
++                try:
++                    os.remove(archive)
++                except OSError:
++                    pass
++
++
++class ScrcpyWorker(QThread):
++    """Runs one scrcpy session and streams its output."""
++    line_ready = pyqtSignal(str)
++    finished_signal = pyqtSignal(int)
++
++    def __init__(self, cmd: List[str]):
++        super().__init__()
++        self.cmd = cmd
++        self.process: Optional[subprocess.Popen] = None
++
++    def run(self):
++        try:
++            self.process = subprocess.Popen(
++                self.cmd,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT,
++                stdin=subprocess.DEVNULL,
++                text=True,
++                encoding="utf-8",
++                errors="replace",
++                bufsize=1,
++                env=scrcpy_env(),
++                creationflags=_CREATE_NO_WINDOW,
++            )
++        except Exception as e:
++            self.line_ready.emit(f"Failed to start scrcpy: {e}")
++            self.finished_signal.emit(-1)
++            return
++
++        assert self.process.stdout is not None
++        for line in self.process.stdout:
++            line = line.rstrip()
++            if line:
++                self.line_ready.emit(line)
++        self.finished_signal.emit(self.process.wait())
++
++    def stop(self):
++        """Ask scrcpy to exit gracefully (lets recordings finalize), then force it."""
++        p = self.process
++        if p is None or p.poll() is not None:
++            return
++        try:
++            p.terminate()
++            p.wait(timeout=3)
++        except subprocess.TimeoutExpired:
++            p.kill()
++        except Exception:
++            pass
++
++
++class DeviceScanWorker(QThread):
++    """Runs DeviceManager.refresh() off the UI thread (adb + getprop can take a few seconds)."""
++    done = pyqtSignal(list)
++
++    def run(self):
++        try:
++            self.done.emit(DeviceManager.instance().refresh())
++        except Exception:
++            self.done.emit([])
++
++
++class ScrcpyWindow(QMainWindow):
++    MAX_SIZES = ["Original", "2560", "1920", "1600", "1280", "1024", "800"]
++    CODECS = ["h264", "h265", "av1"]
++
++    def __init__(self, parent: Optional[QWidget] = None):
++        super().__init__(parent)
++        self.setWindowTitle(f"QuickADB Screen Mirror (scrcpy)  [module v{MODULE_VERSION}]")
++        self.setMinimumSize(760, 600)
++
++        self.scrcpy_path, self.scrcpy_source = find_scrcpy_with_source()
++        self.worker: Optional[ScrcpyWorker] = None
++        self.scan_worker: Optional[DeviceScanWorker] = None
++
++        self._build_ui()
++        ThemeManager.apply_theme(self)
++        self._refresh_scrcpy_label()
++        # Use the main window's last scan if there is one, otherwise scan now
++        if DeviceManager.instance().devices:
++            self._fill_devices(DeviceManager.instance().devices)
++        else:
++            self.scan_devices()
++        if not self.scrcpy_path:
++            QTimer.singleShot(0, self._prompt_missing)  # once the window is visible
++
++    # --- UI ---
++
++    def _build_ui(self):
++        central = QWidget()
++        self.setCentralWidget(central)
++        layout = QVBoxLayout(central)
++
++        # scrcpy location + device
++        top = QGridLayout()
++        top.addWidget(QLabel("scrcpy:"), 0, 0)
++        self.scrcpy_label = QLabel()
++        self.scrcpy_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
++        top.addWidget(self.scrcpy_label, 0, 1)
++        browse_btn = QPushButton("Browse...")
++        browse_btn.clicked.connect(self._browse_scrcpy)
++        top.addWidget(browse_btn, 0, 2)
++        self.get_btn = QPushButton("Get scrcpy")
++        self.get_btn.setToolTip("Download the latest scrcpy into QuickADB's bin folder")
++        self.get_btn.clicked.connect(self.download_scrcpy)
++        top.addWidget(self.get_btn, 0, 3)
++
++        top.addWidget(QLabel("Device:"), 1, 0)
++        self.device_combo = QComboBox()
++        self.device_combo.setPlaceholderText("No devices found, press ⟳ to scan")
++        top.addWidget(self.device_combo, 1, 1)
++        self.scan_btn = QPushButton("⟳")
++        self.scan_btn.setToolTip("Scan for connected devices")
++        self.scan_btn.clicked.connect(self.scan_devices)
++        top.addWidget(self.scan_btn, 1, 2)
++        top.setColumnStretch(1, 1)
++        layout.addLayout(top)
++
++        # Video options
++        video = QGroupBox("Video")
++        vg = QGridLayout(video)
++        vg.addWidget(QLabel("Max size:"), 0, 0)
++        self.max_size = QComboBox()
++        self.max_size.addItems(self.MAX_SIZES)
++        self.max_size.setToolTip("Limit the longer side of the mirrored screen (pixels)")
++        vg.addWidget(self.max_size, 0, 1)
++
++        vg.addWidget(QLabel("Bitrate (Mbps):"), 0, 2)
++        self.bitrate = QSpinBox()
++        self.bitrate.setRange(1, 100)
++        self.bitrate.setValue(8)
++        vg.addWidget(self.bitrate, 0, 3)
++
++        vg.addWidget(QLabel("Max FPS:"), 1, 0)
++        self.max_fps = QSpinBox()
++        self.max_fps.setRange(0, 240)
++        self.max_fps.setSpecialValueText("Unlimited")
++        vg.addWidget(self.max_fps, 1, 1)
++
++        vg.addWidget(QLabel("Codec:"), 1, 2)
++        self.codec = QComboBox()
++        self.codec.addItems(self.CODECS)
++        vg.addWidget(self.codec, 1, 3)
++        layout.addWidget(video)
++
++        # Behaviour options
++        behaviour = QGroupBox("Options")
++        bg = QGridLayout(behaviour)
++        self.audio_cb = QCheckBox("Forward audio (Android 11+)")
++        self.audio_cb.setChecked(True)
++        self.screen_off_cb = QCheckBox("Turn device screen off")
++        self.stay_awake_cb = QCheckBox("Keep device awake")
++        self.show_touches_cb = QCheckBox("Show touches")
++        self.view_only_cb = QCheckBox("View only (no control)")
++        self.power_off_cb = QCheckBox("Lock device on close")
++        self.on_top_cb = QCheckBox("Always on top")
++        self.fullscreen_cb = QCheckBox("Start fullscreen")
++        self.borderless_cb = QCheckBox("Borderless window")
++        boxes = [
++            self.audio_cb, self.screen_off_cb, self.stay_awake_cb,
++            self.show_touches_cb, self.view_only_cb, self.power_off_cb,
++            self.on_top_cb, self.fullscreen_cb, self.borderless_cb,
++        ]
++        for i, cb in enumerate(boxes):
++            bg.addWidget(cb, i // 3, i % 3)
++        layout.addWidget(behaviour)
++
++        # Recording + extra args
++        extra = QGroupBox("Recording && extra arguments")
++        eg = QGridLayout(extra)
++        self.record_cb = QCheckBox("Record to:")
++        self.record_cb.toggled.connect(self._on_record_toggled)
++        eg.addWidget(self.record_cb, 0, 0)
++        self.record_path = QLineEdit()
++        self.record_path.setPlaceholderText("recording.mp4")
++        self.record_path.setEnabled(False)
++        eg.addWidget(self.record_path, 0, 1)
++        self.record_browse = QPushButton("...")
++        self.record_browse.setEnabled(False)
++        self.record_browse.clicked.connect(self._browse_record)
++        eg.addWidget(self.record_browse, 0, 2)
++
++        eg.addWidget(QLabel("Extra args:"), 1, 0)
++        self.extra_args = QLineEdit()
++        self.extra_args.setPlaceholderText("e.g. --crop=1224:1440:0:0 --keyboard=uhid")
++        eg.addWidget(self.extra_args, 1, 1, 1, 2)
++        layout.addWidget(extra)
++
++        # Controls
++        controls = QHBoxLayout()
++        self.start_btn = QPushButton("Start Mirroring")
++        self.start_btn.clicked.connect(self.start_mirroring)
++        self.stop_btn = QPushButton("Stop")
++        self.stop_btn.setEnabled(False)
++        self.stop_btn.clicked.connect(self.stop_mirroring)
++        controls.addWidget(self.start_btn)
++        controls.addWidget(self.stop_btn)
++        controls.addStretch()
++        self.status_label = QLabel("Idle")
++        controls.addWidget(self.status_label)
++        layout.addLayout(controls)
++
++        # Output
++        self.output = QPlainTextEdit()
++        self.output.setReadOnly(True)
++        self.output.setMaximumBlockCount(2000)
++        layout.addWidget(self.output, 1)
++
++    # --- Helpers ---
++
++    # --- Getting scrcpy ---
++
++    def _prompt_missing(self):
++        bin_dir = os.path.join(app_dir(), "bin")
++        resp = QMessageBox.question(
++            self, "scrcpy not found",
++            "scrcpy wasn't found in QuickADB's bin folder or on the system.\n\n"
++            "Download the latest scrcpy release from GitHub now?\n"
++            f"It will be saved to:\n{bin_dir}",
++            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
++            QMessageBox.StandardButton.Yes,
++        )
++        if resp == QMessageBox.StandardButton.Yes:
++            self.download_scrcpy()
++
++    def download_scrcpy(self):
++        if getattr(self, "_dl_worker", None) is not None:
++            return
++        bin_dir = os.path.join(app_dir(), "bin")
++        dlg = QProgressDialog("Looking up the latest scrcpy release...", "Cancel", 0, 0, self)
++        dlg.setWindowTitle("Get scrcpy")
++        dlg.setWindowModality(Qt.WindowModality.WindowModal)
++        dlg.setMinimumDuration(0)
++        dlg.setAutoClose(False)
++        dlg.setAutoReset(False)
++
++        worker = ScrcpyDownloader(bin_dir)
++        self._dl_worker = worker
++        self.get_btn.setEnabled(False)
++
++        def on_progress(got, total):
++            if total:
++                dlg.setMaximum(total)
++                dlg.setValue(got)
++            mb = f"{got / 1048576:.1f}" + (f" / {total / 1048576:.1f}" if total else "")
++            dlg.setLabelText(f"Downloading scrcpy... {mb} MB")
++
++        def finish(folder: Optional[str], error: str = ""):
++            dlg.close()
++            worker.wait(2000)
++            self._dl_worker = None
++            self.get_btn.setEnabled(True)
++            if folder:
++                self._log(f"scrcpy installed to {folder}")
++                self.scrcpy_path, self.scrcpy_source = find_scrcpy_with_source()
++                self._refresh_scrcpy_label()
++                if not self.scrcpy_path:
++                    QMessageBox.warning(self, "Get scrcpy", f"Downloaded to {folder}, but scrcpy still wasn't found there.")
++            elif error != "Download cancelled.":
++                self._log(f"scrcpy download failed: {error}")
++                resp = QMessageBox.warning(
++                    self, "Get scrcpy",
++                    f"Couldn't download scrcpy:\n{error}\n\n"
++                    f"You can get it manually and unzip it into:\n{bin_dir}\n\nOpen the download page?",
++                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
++                if resp == QMessageBox.StandardButton.Yes:
++                    open_url_safe(SCRCPY_URL)
++
++        worker.progress.connect(on_progress)
++        worker.status.connect(dlg.setLabelText)
++        worker.done.connect(lambda folder: finish(folder))
++        worker.failed.connect(lambda msg: finish(None, msg))
++        dlg.canceled.connect(worker.cancel)
++        worker.start()
++        dlg.show()
++
++    def _refresh_scrcpy_label(self):
++        if self.scrcpy_path:
++            version = get_scrcpy_version(self.scrcpy_path) or "scrcpy (unknown version)"
++            version = version.split("<")[0].strip()  # drop the "<github url>" suffix
++            source = f"  ({self.scrcpy_source})" if self.scrcpy_source else ""
++            self.scrcpy_label.setText(version + source)
++            self.scrcpy_label.setStyleSheet("")
++            self.scrcpy_label.setToolTip(self.scrcpy_path)
++            self.start_btn.setEnabled(self.worker is None)
++        else:
++            self.scrcpy_label.setText(f"Not found in {os.path.join(app_dir(), 'bin')} or on the system. "
++                                      "Unzip scrcpy into that bin folder, or use Browse.")
++            self.scrcpy_label.setWordWrap(True)
++            self.scrcpy_label.setStyleSheet(f"color: {MISSING_COLOR}; font-weight: bold;")
++            self.scrcpy_label.setToolTip(f"Looked in {os.path.join(app_dir(), 'bin')}, the system PATH "
++                                         "and common install locations.")
++            self.start_btn.setEnabled(False)
++
++    def scan_devices(self):
++        if self.scan_worker is not None and self.scan_worker.isRunning():
++            return
++        self.scan_btn.setEnabled(False)
++        self.device_combo.setPlaceholderText("Scanning...")
++        self.scan_worker = DeviceScanWorker()
++        self.scan_worker.done.connect(self._fill_devices)
++        self.scan_worker.start()
++
++    def _fill_devices(self, devices: list):
++        """List devices scrcpy can use (adb state 'device'), preselecting the main window's choice."""
++        self.scan_btn.setEnabled(True)
++        self.device_combo.setPlaceholderText("No devices found, press ⟳ to scan")
++        previous = self.device_combo.currentData() or DeviceManager.instance().selected_serial
++
++        self.device_combo.clear()
++        skipped = []
++        for dev in devices:
++            if dev.get("state") != "device":
++                skipped.append(f"{dev.get('serial')} [{dev.get('state')}]")
++                continue
++            name = dev.get("name") or dev["serial"]
++            label = name if name == dev["serial"] else f"{name}  ({dev['serial']})"
++            self.device_combo.addItem(label, userData=dev["serial"])
++
++        if previous:
++            idx = self.device_combo.findData(previous)
++            if idx >= 0:
++                self.device_combo.setCurrentIndex(idx)
++        if self.device_combo.currentIndex() < 0 and self.device_combo.count() > 0:
++            self.device_combo.setCurrentIndex(0)
++
++        if skipped:
++            self._log("Not usable by scrcpy (must be booted with USB debugging authorized): "
++                      + ", ".join(skipped))
++
++    def _browse_scrcpy(self):
++        filt = "scrcpy (scrcpy.exe);;All Files (*)" if os.name == "nt" else "All Files (*)"
++        path, _ = QFileDialog.getOpenFileName(self, "Locate scrcpy executable", "", filt)
++        if not path:
++            return
++        if not get_scrcpy_version(path):
++            QMessageBox.warning(self, "scrcpy", "That file didn't respond like scrcpy (--version failed).")
++            return
++        _settings().setValue(SETTINGS_KEY_PATH, path)
++        self.scrcpy_path, self.scrcpy_source = path, "chosen with Browse"
++        self._refresh_scrcpy_label()
++
++    def _on_record_toggled(self, checked: bool):
++        self.record_path.setEnabled(checked)
++        self.record_browse.setEnabled(checked)
++
++    def _browse_record(self):
++        path, _ = QFileDialog.getSaveFileName(
++            self, "Save recording as", "recording.mp4", "MP4 (*.mp4);;Matroska (*.mkv)"
++        )
++        if path:
++            self.record_path.setText(path)
++
++    def _log(self, text: str):
++        self.output.appendPlainText(text)
++        self.output.moveCursor(QTextCursor.MoveOperation.End)
++
++    def build_command(self) -> List[str]:
++        cmd = [self.scrcpy_path]
++        serial = self.device_combo.currentData()
++        if serial:
++            cmd.append(f"--serial={serial}")
++
++        if self.max_size.currentText() != "Original":
++            cmd.append(f"--max-size={self.max_size.currentText()}")
++        cmd.append(f"--video-bit-rate={self.bitrate.value()}M")
++        if self.max_fps.value() > 0:
++            cmd.append(f"--max-fps={self.max_fps.value()}")
++        if self.codec.currentText() != "h264":
++            cmd.append(f"--video-codec={self.codec.currentText()}")
++
++        flags = [
++            (not self.audio_cb.isChecked(), "--no-audio"),
++            (self.screen_off_cb.isChecked(), "--turn-screen-off"),
++            (self.stay_awake_cb.isChecked(), "--stay-awake"),
++            (self.show_touches_cb.isChecked(), "--show-touches"),
++            (self.view_only_cb.isChecked(), "--no-control"),
++            (self.power_off_cb.isChecked(), "--power-off-on-close"),
++            (self.on_top_cb.isChecked(), "--always-on-top"),
++            (self.fullscreen_cb.isChecked(), "--fullscreen"),
++            (self.borderless_cb.isChecked(), "--window-borderless"),
++        ]
++        cmd += [flag for enabled, flag in flags if enabled]
++
++        if self.record_cb.isChecked():
++            cmd.append(f"--record={self.record_path.text().strip() or 'recording.mp4'}")
++
++        device_name = self.device_combo.currentText().split("  (")[0] if serial else "scrcpy"
++        cmd.append(f"--window-title=QuickADB - {device_name}")
++
++        extra = self.extra_args.text().strip()
++        if extra:
++            import shlex
++            cmd += shlex.split(extra, posix=(os.name != "nt"))
++        return cmd
++
++    # --- Session control ---
++
++    def start_mirroring(self):
++        if self.worker is not None:
++            return
++        if not _usable(self.scrcpy_path):
++            self.scrcpy_path, self.scrcpy_source = find_scrcpy_with_source()
++            self._refresh_scrcpy_label()
++        if not self.scrcpy_path:
++            QMessageBox.warning(
++                self, "scrcpy not found",
++                "scrcpy wasn't found.\n\nUnzip it anywhere inside:\n" + os.path.join(app_dir(), "bin") +
++                "\n\nor install it system-wide, or use Browse to locate it.")
++            return
++        if self.device_combo.count() == 0:
++            QMessageBox.warning(self, "No device",
++                                "No usable device found. Connect one (USB or wireless) and press ⟳.")
++            return
++        try:
++            cmd = self.build_command()
++        except ValueError as e:
++            QMessageBox.warning(self, "Extra arguments", f"Couldn't parse extra arguments: {e}")
++            return
++
++        self._log("$ " + " ".join(cmd))
++        self.worker = ScrcpyWorker(cmd)
++        self.worker.line_ready.connect(self._log)
++        self.worker.finished_signal.connect(self._on_finished)
++        self.worker.start()
++        self.start_btn.setEnabled(False)
++        self.stop_btn.setEnabled(True)
++        self.status_label.setText("Running")
++
++    def stop_mirroring(self):
++        if self.worker is not None:
++            self.status_label.setText("Stopping...")
++            self.worker.stop()
++
++    def _on_finished(self, code: int):
++        self._log(f"scrcpy exited with code {code}")
++        if self.worker is not None:
++            self.worker.wait(1000)
++        self.worker = None
++        self.stop_btn.setEnabled(False)
++        self.status_label.setText("Idle" if code == 0 else f"Exited ({code})")
++        self._refresh_scrcpy_label()
++
++    def closeEvent(self, event):
++        if getattr(self, "_dl_worker", None) is not None:
++            self._dl_worker.cancel()
++            self._dl_worker.wait(5000)
++        if self.scan_worker is not None:
++            self.scan_worker.wait(5000)
++        if self.worker is not None:
++            self.worker.stop()
++            self.worker.wait(4000)
++        super().closeEvent(event)
++
++
++def run_scrcpy_window():
++    existing = QApplication.instance()
++    if existing is None:
++        app = QApplication(sys.argv)
++        window = ScrcpyWindow()
++        window.show()
++        sys.exit(app.exec())
++
++    window = ScrcpyWindow()
++    window.show()
++    return window
++
++
++if __name__ == "__main__":
++    run_scrcpy_window()
+diff --git a/modules/terminal.py b/modules/terminal.py
+index f8d920c..515636b 100644
+--- a/modules/terminal.py
++++ b/modules/terminal.py
+@@ -234,7 +234,8 @@ class TerminalWindow(QMainWindow):
+         
+         self.app_version = app_version
+         self.app_suffix = app_suffix
+-        self.platform_tools_path = resource_path('platform-tools')
++        from util.toolpaths import ToolPaths
++        self.platform_tools_path = ToolPaths.instance().platform_tools_dir
+         
+         self.system = platform.system()
+         self.is_windows = self.system == "Windows"
+diff --git a/util/platformtools.py b/util/platformtools.py
+new file mode 100644
+index 0000000..21443bb
+--- /dev/null
++++ b/util/platformtools.py
+@@ -0,0 +1,181 @@
++"""
++platformtools.py - "adb not found" prompt and in-app download of Google's platform-tools.
++
++The zip is downloaded next to QuickADB, extracted to <QuickADB folder>/platform-tools,
++the zip is deleted, and ToolPaths is re-run so the new adb is used immediately.
++"""
++import os
++import platform
++import shutil
++import ssl
++import urllib.request
++import zipfile
++from typing import Callable, Optional
++
++from PyQt6.QtCore import QThread, pyqtSignal, Qt
++from PyQt6.QtWidgets import QMessageBox, QProgressDialog, QWidget
++
++from util.toolpaths import ToolPaths, app_dir, default_download_dir
++
++PLATFORM_TOOLS_URLS = {
++    "Windows": "https://dl.google.com/android/repository/platform-tools-latest-windows.zip",
++    "Linux": "https://dl.google.com/android/repository/platform-tools-latest-linux.zip",
++    "Darwin": "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip",
++}
++PLATFORM_TOOLS_PAGE = "https://developer.android.com/tools/releases/platform-tools"
++_EXECUTABLES = ("adb", "fastboot", "mke2fs", "etc1tool", "hprof-conv", "make_f2fs",
++                "make_f2fs_casefold", "sqlite3", "dmtracedump")
++
++
++def platform_tools_url() -> Optional[str]:
++    return PLATFORM_TOOLS_URLS.get(platform.system())
++
++
++def _ssl_context() -> ssl.SSLContext:
++    """Prefer certifi's CA bundle when available (frozen builds often lack system certs)."""
++    try:
++        import certifi
++        return ssl.create_default_context(cafile=certifi.where())
++    except Exception:
++        return ssl.create_default_context()
++
++
++class PlatformToolsDownloader(QThread):
++    """Downloads and extracts platform-tools into `dest_parent`/platform-tools."""
++    progress = pyqtSignal(int, int)   # bytes done, total (0 if unknown)
++    status = pyqtSignal(str)
++    done = pyqtSignal(str)            # folder that now contains adb
++    failed = pyqtSignal(str)
++
++    def __init__(self, url: str, dest_parent: str):
++        super().__init__()
++        self.url = url
++        self.dest_parent = dest_parent
++        self._cancel = False
++
++    def cancel(self):
++        self._cancel = True
++
++    def run(self):
++        zip_path = os.path.join(self.dest_parent, os.path.basename(self.url) + ".part")
++        try:
++            os.makedirs(self.dest_parent, exist_ok=True)
++            self.status.emit("Downloading platform-tools...")
++            req = urllib.request.Request(self.url, headers={"User-Agent": "QuickADB"})
++            with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp, \
++                    open(zip_path, "wb") as out:
++                total = int(resp.headers.get("Content-Length") or 0)
++                got = 0
++                while True:
++                    if self._cancel:
++                        raise InterruptedError("Download cancelled.")
++                    chunk = resp.read(256 * 1024)
++                    if not chunk:
++                        break
++                    out.write(chunk)
++                    got += len(chunk)
++                    self.progress.emit(got, total)
++
++            self.status.emit("Extracting...")
++            with zipfile.ZipFile(zip_path) as z:
++                # The archive holds a single top-level platform-tools/ folder.
++                for name in z.namelist():
++                    if os.path.isabs(name) or ".." in name.replace("\\", "/").split("/"):
++                        raise ValueError(f"Unsafe path in archive: {name}")
++                target = os.path.join(self.dest_parent, "platform-tools")
++                if os.path.isdir(target):
++                    shutil.rmtree(target, ignore_errors=True)
++                z.extractall(self.dest_parent)
++
++            pt_dir = os.path.join(self.dest_parent, "platform-tools")
++            if os.name != "nt":
++                for f in _EXECUTABLES:
++                    p = os.path.join(pt_dir, f)
++                    if os.path.isfile(p):
++                        os.chmod(p, 0o755)
++            adb = os.path.join(pt_dir, "adb.exe" if os.name == "nt" else "adb")
++            if not os.path.isfile(adb):
++                raise FileNotFoundError("The download didn't contain adb.")
++            self.done.emit(pt_dir)
++        except Exception as e:
++            self.failed.emit(str(e))
++        finally:
++            try:
++                if os.path.exists(zip_path):
++                    os.remove(zip_path)
++            except OSError:
++                pass
++
++
++def start_download(parent: QWidget, on_finished: Optional[Callable[[bool], None]] = None):
++    """Download platform-tools with a progress dialog. Calls on_finished(success)."""
++    url = platform_tools_url()
++    if not url:
++        QMessageBox.warning(parent, "platform-tools",
++                            f"No platform-tools download for {platform.system()}.\n"
++                            f"Get it from:\n{PLATFORM_TOOLS_PAGE}")
++        if on_finished:
++            on_finished(False)
++        return
++
++    dest_parent = app_dir()
++    dlg = QProgressDialog("Downloading platform-tools...", "Cancel", 0, 0, parent)
++    dlg.setWindowTitle("platform-tools")
++    dlg.setWindowModality(Qt.WindowModality.WindowModal)
++    dlg.setMinimumDuration(0)
++    dlg.setAutoClose(False)
++    dlg.setAutoReset(False)
++
++    worker = PlatformToolsDownloader(url, dest_parent)
++    parent._pt_download_worker = worker  # keep a reference alive
++
++    def on_progress(done, total):
++        if total:
++            dlg.setMaximum(total)
++            dlg.setValue(done)
++            dlg.setLabelText(f"Downloading platform-tools... {done / 1048576:.1f} / {total / 1048576:.1f} MB")
++        else:
++            dlg.setLabelText(f"Downloading platform-tools... {done / 1048576:.1f} MB")
++
++    def finish(ok: bool, message: str = ""):
++        dlg.close()
++        worker.wait(2000)
++        parent._pt_download_worker = None
++        if ok:
++            ToolPaths.instance().refresh()
++            QMessageBox.information(parent, "platform-tools",
++                                    f"platform-tools installed to:\n{default_download_dir()}")
++        elif message != "Download cancelled.":
++            QMessageBox.warning(
++                parent, "platform-tools",
++                f"Couldn't install platform-tools:\n{message}\n\n"
++                f"You can download it manually from:\n{PLATFORM_TOOLS_PAGE}\n"
++                f"and unzip it into:\n{dest_parent}")
++        if on_finished:
++            on_finished(ok)
++
++    worker.progress.connect(on_progress)
++    worker.status.connect(dlg.setLabelText)
++    worker.done.connect(lambda _p: finish(True))
++    worker.failed.connect(lambda msg: finish(False, msg))
++    dlg.canceled.connect(worker.cancel)
++    worker.start()
++    dlg.show()
++
++
++def prompt_adb_missing(parent: QWidget, on_finished: Optional[Callable[[bool], None]] = None):
++    """Tell the user adb wasn't found and offer to download platform-tools."""
++    resp = QMessageBox.question(
++        parent,
++        "adb not found",
++        "adb wasn't found on your system PATH or in the QuickADB folder:\n"
++        f"{app_dir()}\n\n"
++        "adb comes in Google's platform-tools package. Download it now?\n"
++        f"It will be saved to:\n{default_download_dir()}",
++        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
++        QMessageBox.StandardButton.Yes,
++    )
++    if resp == QMessageBox.StandardButton.Yes:
++        start_download(parent, on_finished)
++    elif on_finished:
++        on_finished(False)
+diff --git a/util/toolpaths.py b/util/toolpaths.py
+index 03e815c..b9596bb 100644
+--- a/util/toolpaths.py
++++ b/util/toolpaths.py
+@@ -1,27 +1,111 @@
+ """
+-toolpaths.py  –  Single source path for platform-tools executables.
++toolpaths.py  -  Single source of truth for where adb / fastboot live.
+ 
+ Every module should import from here instead of resolving paths locally.
+ 
+ Usage:
+     from util.toolpaths import ToolPaths
+     tp = ToolPaths.instance()
+-    adb   = tp.adb        # absolute path to adb / adb.exe
++    tp.found               # True if a usable adb was located
++    adb   = tp.adb         # absolute path to adb / adb.exe (bare "adb" if not found)
+     fb    = tp.fastboot    # absolute path to fastboot / fastboot.exe
+-    ptdir = tp.platform_tools_dir  # the directory itself
++    ptdir = tp.platform_tools_dir  # folder containing adb
++    tp.source              # "system PATH", "QuickADB folder" or "" (not found)
++    tp.refresh()           # re-run detection, e.g. after downloading platform-tools
++
++Lookup order for adb:
++  1. The system PATH.
++  2. The QuickADB folder and its subfolders (up to SEARCH_DEPTH levels), so
++     QuickADB/platform-tools/adb.exe, QuickADB/bin/platform-tools/adb.exe,
++     QuickADB/tools/adb/adb.exe etc. are all found.
++  3. Nothing found: `found` is False, and the main window offers to download
++     Google's platform-tools into QuickADB/platform-tools.
++
++platform-tools is deliberately NOT bundled inside the packaged executable any more.
++A one-file PyInstaller build unpacks to a temporary _MEI folder; an adb server started
++from there keeps running after QuickADB exits and keeps adb.exe and its DLLs locked,
++so the temporary folder can't be deleted and an error is shown on exit.
+ """
+-from util.resource import resource_path, resolve_platform_tool
++import os
++import shutil
++import sys
++from typing import List, Optional, Tuple
++
++SEARCH_DEPTH = 4  # folder levels below the QuickADB folder to search
++DOWNLOAD_DIR_NAME = "platform-tools"
++
++# Folders never worth searching (large or irrelevant)
++_SKIP_DIRS = {"__pycache__", "node_modules", "build", "dist", "venv", ".venv", "env"}
++
++
++def _exe(name: str) -> str:
++    return name + ".exe" if os.name == "nt" else name
++
++
++def app_dir() -> str:
++    """The folder the user sees QuickADB in.
++
++    From source: the folder containing main.py.
++    Packaged: the folder containing the QuickADB executable (or the AppImage file),
++    never PyInstaller's temporary extraction folder.
++    """
++    if getattr(sys, "frozen", False):
++        exe = os.environ.get("APPIMAGE") or sys.executable
++        return os.path.dirname(os.path.abspath(exe))
++    # this file is util/toolpaths.py, so the root is one level up
++    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++
++def default_download_dir() -> str:
++    """Where a downloaded platform-tools ends up: <QuickADB folder>/platform-tools."""
++    return os.path.join(app_dir(), DOWNLOAD_DIR_NAME)
++
++
++def _usable(path: Optional[str]) -> bool:
++    return bool(path) and os.path.isfile(path) and (os.name == "nt" or os.access(path, os.X_OK))
++
++
++def _from_path(tool: str) -> Optional[str]:
++    found = shutil.which(tool)
++    return os.path.abspath(found) if found and _usable(found) else None
++
++
++def _search_folder(base: str, tool: str, depth: int = SEARCH_DEPTH) -> Optional[str]:
++    """Find `tool` anywhere under `base`, up to `depth` levels down.
++
++    Best match first: a folder named platform-tools, then the shallowest, then
++    alphabetical order (so the result is stable between runs)."""
++    if not os.path.isdir(base):
++        return None
++    target = _exe(tool).lower()
++    base_depth = base.rstrip(os.sep).count(os.sep)
++    found: List[Tuple[int, int, str]] = []
++    for dirpath, dirnames, filenames in os.walk(base):
++        level = dirpath.rstrip(os.sep).count(os.sep) - base_depth
++        if level >= depth:
++            dirnames[:] = []
++        else:
++            dirnames[:] = sorted(d for d in dirnames
++                                 if not d.startswith(".") and d.lower() not in _SKIP_DIRS)
++        for f in filenames:
++            if f.lower() == target:
++                path = os.path.join(dirpath, f)
++                if _usable(path):
++                    not_pt = os.path.basename(dirpath).lower() != "platform-tools"
++                    found.append((not_pt, level, path))
++    return sorted(found)[0][2] if found else None
+ 
+ 
+ class ToolPaths:
+-    """Singleton that lazily resolves and caches platform-tool paths."""
++    """Singleton that resolves and caches platform-tool paths."""
+ 
+     _instance = None
+ 
+     def __init__(self):
+-        self._platform_tools_dir = resource_path("platform-tools")
+-        self._adb = None
+-        self._fastboot = None
++        self._adb: Optional[str] = None
++        self._fastboot: Optional[str] = None
++        self._source: str = ""
++        self.refresh()
+ 
+     # --- singleton accessor ---
+     @classmethod
+@@ -30,19 +114,52 @@ class ToolPaths:
+             cls._instance = cls()
+         return cls._instance
+ 
++    # --- detection ---
++    def refresh(self) -> bool:
++        """(Re)detect adb and fastboot. Returns True if adb was found."""
++        adb = _from_path("adb")
++        source = "system PATH" if adb else ""
++        if not adb:
++            adb = _search_folder(app_dir(), "adb")
++            source = "QuickADB folder" if adb else ""
++
++        # fastboot: next to adb first (same platform-tools release), then PATH, then search
++        fastboot = None
++        if adb:
++            beside = os.path.join(os.path.dirname(adb), _exe("fastboot"))
++            fastboot = beside if _usable(beside) else None
++        fastboot = fastboot or _from_path("fastboot") or _search_folder(app_dir(), "fastboot")
++
++        self._adb, self._fastboot, self._source = adb, fastboot, source
++        return adb is not None
++
+     # --- public properties ---
+     @property
+-    def platform_tools_dir(self) -> str:
+-        return self._platform_tools_dir
++    def found(self) -> bool:
++        return self._adb is not None
++
++    @property
++    def fastboot_found(self) -> bool:
++        return self._fastboot is not None
++
++    @property
++    def source(self) -> str:
++        return self._source
+ 
+     @property
+     def adb(self) -> str:
+-        if self._adb is None:
+-            self._adb = resolve_platform_tool(self._platform_tools_dir, "adb")
+-        return self._adb
++        # Bare name when missing: subprocess then fails with FileNotFoundError,
++        # which every caller already handles, instead of crashing on None.
++        return self._adb or _exe("adb")
+ 
+     @property
+     def fastboot(self) -> str:
+-        if self._fastboot is None:
+-            self._fastboot = resolve_platform_tool(self._platform_tools_dir, "fastboot")
+-        return self._fastboot
++        return self._fastboot or _exe("fastboot")
++
++    @property
++    def platform_tools_dir(self) -> str:
++        """Folder containing adb. Falls back to the QuickADB folder (which always exists)
++        so it stays usable as a working directory when adb is missing."""
++        if self._adb:
++            return os.path.dirname(self._adb)
++        return app_dir()
